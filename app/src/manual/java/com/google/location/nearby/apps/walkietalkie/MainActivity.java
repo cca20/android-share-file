@@ -85,6 +85,9 @@ public class MainActivity extends ConnectionsActivity implements SensorEventList
   /** Length of state change animations. */
   private static final long ANIMATION_DURATION = 600;
 
+  /** Request code for image picker result. */
+  private static final int READ_REQUEST_CODE = 42;
+
   /**
    * This service id lets us find other nearby devices that are interested in the same thing. Our
    * sample does exactly one thing, so we hardcode the ID.
