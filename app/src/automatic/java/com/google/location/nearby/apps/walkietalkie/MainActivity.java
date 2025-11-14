@@ -4,6 +4,9 @@ import android.Manifest;
 import android.animation.Animator;
 import android.animation.ObjectAnimator;
 import android.content.Context;
+import android.app.Activity;
+import android.content.Intent;
+import android.net.Uri;
 import android.media.AudioManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -22,12 +25,25 @@ import android.text.style.ForegroundColorSpan;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewAnimationUtils;
+import android.widget.Button;
 import android.widget.TextView;
 import android.widget.Toast;
 import com.google.android.gms.nearby.connection.ConnectionInfo;
 import com.google.android.gms.nearby.connection.Payload;
+import com.google.android.gms.nearby.connection.PayloadTransferUpdate;
 import com.google.android.gms.nearby.connection.Strategy;
+import android.content.ContentValues;
+import android.os.Environment;
+import android.provider.MediaStore;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.FileNotFoundException;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Random;
 
 /**
@@ -54,6 +70,8 @@ public class MainActivity extends ConnectionsActivity {
 
   /** Length of state change animations. */
   private static final long ANIMATION_DURATION = 600;
+
+  private static final int READ_REQUEST_CODE = 42;
 
   /**
    * A set of background colors. We'll hash the authentication token we get from connecting to a
@@ -132,6 +150,8 @@ public class MainActivity extends ConnectionsActivity {
   /** The phone's original media volume. */
   private int mOriginalVolume;
 
+  private final Map<Long, Payload> mReceivedFilePayloads = new HashMap<>();
+
   @Override
   protected void onCreate(Bundle savedInstanceState) {
     super.onCreate(savedInstanceState);
@@ -149,6 +169,107 @@ public class MainActivity extends ConnectionsActivity {
     mName = generateRandomName();
 
     ((TextView) findViewById(R.id.name)).setText(mName);
+
+    Button shareButton = (Button) findViewById(R.id.share_button);
+    shareButton.setOnClickListener(new View.OnClickListener() {
+      @Override
+      public void onClick(View v) {
+        if (getConnectedEndpoints().isEmpty()) {
+          Toast.makeText(MainActivity.this, "No connected devices", Toast.LENGTH_SHORT).show();
+          return;
+        }
+        showImageChooser();
+      }
+    });
+  }
+
+  private void showImageChooser() {
+    Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+    intent.addCategory(Intent.CATEGORY_OPENABLE);
+    intent.setType("image/*");
+    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+    startActivityForResult(intent, READ_REQUEST_CODE);
+  }
+
+  @Override
+  protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+    super.onActivityResult(requestCode, resultCode, data);
+    if (requestCode == READ_REQUEST_CODE && resultCode == Activity.RESULT_OK && data != null) {
+      Uri uri = data.getData();
+      if (uri != null) {
+        if (getConnectedEndpoints().isEmpty()) {
+          Toast.makeText(this, "No connected devices", Toast.LENGTH_SHORT).show();
+          return;
+        }
+        if (getState() != State.CONNECTED) {
+          Toast.makeText(this, "Not connected to any device", Toast.LENGTH_SHORT).show();
+          return;
+        }
+        final Uri finalUri = uri;
+        new Thread(new Runnable() {
+          @Override
+          @WorkerThread
+          public void run() {
+            ParcelFileDescriptor pfd = null;
+            try {
+              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                getContentResolver().takePersistableUriPermission(
+                    finalUri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+              }
+              pfd = getContentResolver().openFileDescriptor(finalUri, "r");
+              if (pfd != null) {
+                final ParcelFileDescriptor finalPfd = pfd;
+                Payload filePayload = Payload.fromFile(pfd);
+                logD("Sending FILE payload, ID: " + filePayload.getId());
+                final Payload finalPayload = filePayload;
+                runOnUiThread(new Runnable() {
+                  @Override
+                  @UiThread
+                  public void run() {
+                    if (getConnectedEndpoints().isEmpty() || getState() != State.CONNECTED) {
+                      logW("Connection lost while preparing file", null);
+                      Toast.makeText(MainActivity.this, "Connection lost", Toast.LENGTH_SHORT).show();
+                      try {
+                        finalPfd.close();
+                      } catch (IOException e) {
+                        logE("Error closing file descriptor", e);
+                      }
+                      return;
+                    }
+                    send(finalPayload);
+                    Toast.makeText(MainActivity.this, "Sending photo...", Toast.LENGTH_SHORT).show();
+                  }
+                });
+              } else {
+                runOnUiThread(new Runnable() {
+                  @Override
+                  public void run() {
+                    logE("Failed to open file descriptor", null);
+                    Toast.makeText(MainActivity.this, "Failed to open file", Toast.LENGTH_SHORT).show();
+                  }
+                });
+              }
+            } catch (FileNotFoundException e) {
+              logE("File not found", e);
+              runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                  Toast.makeText(MainActivity.this, "File not found", Toast.LENGTH_SHORT).show();
+                }
+              });
+            } catch (Exception e) {
+              logE("Error sending file", e);
+              runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                  Toast.makeText(MainActivity.this, "Error sending file: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+                }
+              });
+            }
+          }
+        }).start();
+      }
+    }
   }
 
   @Override
@@ -170,7 +291,9 @@ public class MainActivity extends ConnectionsActivity {
     audioManager.setStreamVolume(
         AudioManager.STREAM_MUSIC, audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC), 0);
 
-    setState(State.SEARCHING);
+    if (getState() == State.UNKNOWN) {
+      setState(State.SEARCHING);
+    }
   }
 
   @Override
@@ -188,8 +311,9 @@ public class MainActivity extends ConnectionsActivity {
       stopPlaying();
     }
 
-    // After our Activity stops, we disconnect from Nearby Connections.
-    setState(State.UNKNOWN);
+    if (isFinishing()) {
+      setState(State.UNKNOWN);
+    }
 
     if (mCurrentAnimator != null && mCurrentAnimator.isRunning()) {
       mCurrentAnimator.cancel();
@@ -243,9 +367,32 @@ public class MainActivity extends ConnectionsActivity {
 
   @Override
   protected void onConnectionFailed(Endpoint endpoint) {
-    // Let's try someone else.
+    logW("Connection failed for endpoint: " + (endpoint != null ? endpoint.getName() : "null"));
+
+    // Clean up any stale state before retrying
+    if (endpoint != null) {
+      disconnect(endpoint);
+    }
+
+    // Wait a bit before retrying to avoid immediate retry conflicts
+    // Let's try someone else after a short delay
     if (getState() == State.SEARCHING) {
-      startDiscovering();
+      mCurrentStateView.postDelayed(new Runnable() {
+        @Override
+        public void run() {
+          if (getState() == State.SEARCHING) {
+            logD("Retrying discovery after connection failure");
+            // Check permissions before retrying
+            if (hasPermissions(MainActivity.this, getRequiredPermissions())) {
+              startDiscovering();
+            } else {
+              logW("Missing permissions, cannot retry discovery");
+              Toast.makeText(MainActivity.this, "Missing permissions. Please grant location permission.",
+                  Toast.LENGTH_SHORT).show();
+            }
+          }
+        }
+      }, 2000); // Wait 2 seconds before retrying
     }
   }
 
@@ -286,8 +433,19 @@ public class MainActivity extends ConnectionsActivity {
     switch (newState) {
       case SEARCHING:
         disconnectFromAllEndpoints();
+        logD("SEARCHING state: Starting discovering and advertising");
         startDiscovering();
-        startAdvertising();
+        // Add a small delay before starting advertising to ensure discovery starts
+        // first
+        mCurrentStateView.postDelayed(new Runnable() {
+          @Override
+          public void run() {
+            if (getState() == State.SEARCHING) {
+              logD("SEARCHING state: Now starting advertising");
+              startAdvertising();
+            }
+          }
+        }, 500);
         break;
       case CONNECTED:
         stopDiscovering();
@@ -440,6 +598,8 @@ public class MainActivity extends ConnectionsActivity {
   /** {@see ConnectionsActivity#onReceive(Endpoint, Payload)} */
   @Override
   protected void onReceive(Endpoint endpoint, Payload payload) {
+    logD("Received payload from " + endpoint.getName() + ", type: " + payload.getType());
+
     if (payload.getType() == Payload.Type.STREAM) {
       if (mAudioPlayer != null) {
         mAudioPlayer.stop();
@@ -463,6 +623,125 @@ public class MainActivity extends ConnectionsActivity {
           };
       mAudioPlayer = player;
       player.start();
+    } else if (payload.getType() == Payload.Type.FILE) {
+      logD("Received FILE payload, ID: " + payload.getId());
+      mReceivedFilePayloads.put(payload.getId(), payload);
+      Toast.makeText(this, "Receiving file from " + endpoint.getName() + "...", Toast.LENGTH_SHORT).show();
+    } else if (payload.getType() == Payload.Type.BYTES) {
+      logD("Received BYTES payload");
+      byte[] bytes = payload.asBytes();
+      Toast.makeText(this, "Received " + bytes.length + " bytes from " + endpoint.getName(), Toast.LENGTH_SHORT).show();
+    }
+  }
+
+  @Override
+  protected void onPayloadTransferUpdate(Endpoint endpoint, PayloadTransferUpdate update) {
+    super.onPayloadTransferUpdate(endpoint, update);
+    if (update.getStatus() == PayloadTransferUpdate.Status.SUCCESS) {
+      Payload payload = mReceivedFilePayloads.get(update.getPayloadId());
+      if (payload != null && payload.getType() == Payload.Type.FILE) {
+        new Thread(new Runnable() {
+          @Override
+          @WorkerThread
+          public void run() {
+            try {
+              com.google.android.gms.nearby.connection.Payload.File payloadFile = payload.asFile();
+              String fileName = "received_image_" + System.currentTimeMillis() + ".jpg";
+              String finalPath;
+              String finalName = fileName;
+
+              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.Downloads.DISPLAY_NAME, fileName);
+                values.put(MediaStore.Downloads.MIME_TYPE, "image/jpeg");
+                values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+                values.put(MediaStore.Downloads.IS_PENDING, 1);
+
+                Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                if (uri != null) {
+                  try (OutputStream os = getContentResolver().openOutputStream(uri)) {
+                    ParcelFileDescriptor pfd = payloadFile.asParcelFileDescriptor();
+                    if (pfd != null) {
+                      try (InputStream is = new ParcelFileDescriptor.AutoCloseInputStream(pfd)) {
+                        byte[] buffer = new byte[8192];
+                        int bytesRead;
+                        while ((bytesRead = is.read(buffer)) != -1) {
+                          os.write(buffer, 0, bytesRead);
+                        }
+                      }
+                    } else {
+                      throw new Exception("Failed to get ParcelFileDescriptor from payload");
+                    }
+                  }
+                  values.clear();
+                  values.put(MediaStore.Downloads.IS_PENDING, 0);
+                  getContentResolver().update(uri, values, null, null);
+                  finalPath = "Downloads/" + fileName;
+                } else {
+                  throw new Exception("Failed to create MediaStore entry");
+                }
+              } else {
+                File downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                if (!downloadsDir.exists()) {
+                  downloadsDir.mkdirs();
+                }
+                File destFile = new File(downloadsDir, fileName);
+                if (destFile.exists()) {
+                  String baseName = fileName.substring(0, fileName.lastIndexOf('.'));
+                  String extension = fileName.substring(fileName.lastIndexOf('.'));
+                  finalName = baseName + "_" + System.currentTimeMillis() + extension;
+                  destFile = new File(downloadsDir, finalName);
+                }
+                ParcelFileDescriptor pfd = payloadFile.asParcelFileDescriptor();
+                if (pfd != null) {
+                  try (InputStream in = new ParcelFileDescriptor.AutoCloseInputStream(pfd);
+                      OutputStream out = new FileOutputStream(destFile)) {
+                    byte[] buffer = new byte[8192];
+                    int bytesRead;
+                    while ((bytesRead = in.read(buffer)) != -1) {
+                      out.write(buffer, 0, bytesRead);
+                    }
+                  }
+                } else {
+                  throw new Exception("Failed to get ParcelFileDescriptor from payload");
+                }
+                finalPath = destFile.getAbsolutePath();
+              }
+
+              final String finalName1 = finalName;
+              final String finalPath1 = finalPath;
+              runOnUiThread(new Runnable() {
+                @Override
+                @UiThread
+                public void run() {
+                  Toast.makeText(MainActivity.this,
+                      "File saved: " + finalName1 + "\nLocation: Downloads folder\nPath: " + finalPath1,
+                      Toast.LENGTH_LONG).show();
+                }
+              });
+              mReceivedFilePayloads.remove(update.getPayloadId());
+            } catch (Exception e) {
+              logE("Error processing received file", e);
+              runOnUiThread(new Runnable() {
+                @Override
+                @UiThread
+                public void run() {
+                  Toast.makeText(MainActivity.this, "File transfer completed but error saving: " + e.getMessage(),
+                      Toast.LENGTH_LONG).show();
+                }
+              });
+              mReceivedFilePayloads.remove(update.getPayloadId());
+            }
+          }
+        }).start();
+      }
+    } else if (update.getStatus() == PayloadTransferUpdate.Status.FAILURE) {
+      Payload payload = mReceivedFilePayloads.get(update.getPayloadId());
+      if (payload != null && payload.getType() == Payload.Type.FILE) {
+        logE("File transfer failed", null);
+        Toast.makeText(this, "File transfer failed", Toast.LENGTH_SHORT).show();
+        mReceivedFilePayloads.remove(update.getPayloadId());
+      }
     }
   }
 

@@ -179,7 +179,15 @@ public abstract class ConnectionsActivity extends AppCompatActivity {
         public void onPayloadTransferUpdate(String endpointId, PayloadTransferUpdate update) {
           logD(
               String.format(
-                  "onPayloadTransferUpdate(endpointId=%s, update=%s)", endpointId, update));
+                  "onPayloadTransferUpdate(endpointId=%s, payloadId=%d, status=%s, bytesTransferred=%d, totalBytes=%d)",
+                  endpointId, update.getPayloadId(), update.getStatus(), 
+                  update.getBytesTransferred(), update.getTotalBytes()));
+          Endpoint endpoint = mEstablishedConnections.get(endpointId);
+          if (endpoint != null) {
+            ConnectionsActivity.this.onPayloadTransferUpdate(endpoint, update);
+          } else {
+            logW("onPayloadTransferUpdate called for unknown endpoint: " + endpointId);
+          }
         }
       };
 
@@ -232,8 +240,28 @@ public abstract class ConnectionsActivity extends AppCompatActivity {
    * we've found out if we successfully entered this mode.
    */
   protected void startAdvertising() {
+    // Check if already advertising to avoid STATUS_ALREADY_ADVERTISING error
+    if (mIsAdvertising) {
+      logW("Already advertising, skipping startAdvertising()");
+      return;
+    }
+    
+    // Check permissions before starting advertising
+    if (!hasPermissions(this, getRequiredPermissions())) {
+      logW("Missing required permissions for advertising. Requesting permissions...");
+      if (Build.VERSION.SDK_INT < 23) {
+        ActivityCompat.requestPermissions(
+            this, getRequiredPermissions(), REQUEST_CODE_REQUIRED_PERMISSIONS);
+      } else {
+        requestPermissions(getRequiredPermissions(), REQUEST_CODE_REQUIRED_PERMISSIONS);
+      }
+      return;
+    }
+    
     mIsAdvertising = true;
     final String localEndpointName = getName();
+
+    logD("Starting advertising with name: " + localEndpointName + ", serviceId: " + getServiceId() + ", strategy: " + getStrategy());
 
     AdvertisingOptions.Builder advertisingOptions = new AdvertisingOptions.Builder();
     advertisingOptions.setStrategy(getStrategy());
@@ -320,6 +348,25 @@ public abstract class ConnectionsActivity extends AppCompatActivity {
    * out if we successfully entered this mode.
    */
   protected void startDiscovering() {
+    // Check if already discovering to avoid STATUS_ALREADY_DISCOVERING error
+    if (mIsDiscovering) {
+      logW("Already discovering, skipping startDiscovering()");
+      return;
+    }
+    
+    // Check permissions before starting discovery
+    if (!hasPermissions(this, getRequiredPermissions())) {
+      logW("Missing required permissions for discovery. Requesting permissions...");
+      if (Build.VERSION.SDK_INT < 23) {
+        ActivityCompat.requestPermissions(
+            this, getRequiredPermissions(), REQUEST_CODE_REQUIRED_PERMISSIONS);
+      } else {
+        requestPermissions(getRequiredPermissions(), REQUEST_CODE_REQUIRED_PERMISSIONS);
+      }
+      return;
+    }
+    
+    logD("Starting discovery with serviceId: " + getServiceId() + ", strategy: " + getStrategy());
     mIsDiscovering = true;
     mDiscoveredEndpoints.clear();
     DiscoveryOptions.Builder discoveryOptions = new DiscoveryOptions.Builder();
@@ -352,6 +399,7 @@ public abstract class ConnectionsActivity extends AppCompatActivity {
             new OnSuccessListener<Void>() {
               @Override
               public void onSuccess(Void unusedResult) {
+                logD("Discovery started successfully");
                 onDiscoveryStarted();
               }
             })
@@ -361,6 +409,21 @@ public abstract class ConnectionsActivity extends AppCompatActivity {
               public void onFailure(@NonNull Exception e) {
                 mIsDiscovering = false;
                 logW("startDiscovering() failed.", e);
+                String errorMsg = e.getMessage();
+                logE("startDiscovering() error: " + e.getClass().getSimpleName() + " - " + errorMsg, e);
+                
+                // Handle specific error codes
+                if (errorMsg != null && errorMsg.contains("8002")) {
+                  logE("STATUS_ALREADY_DISCOVERING (8002) - Discovery already running. Attempting to stop and retry.", null);
+                  // Force stop and clear state
+                  try {
+                    mConnectionsClient.stopDiscovery();
+                  } catch (Exception ex) {
+                    logW("Error force stopping discovery", ex);
+                  }
+                  mIsDiscovering = false;
+                }
+                
                 onDiscoveryFailed();
               }
             });
@@ -505,6 +568,14 @@ public abstract class ConnectionsActivity extends AppCompatActivity {
    * @param payload The data.
    */
   protected void onReceive(Endpoint endpoint, Payload payload) {}
+
+  /**
+   * Called when payload transfer status is updated. Override this method to track transfer progress.
+   *
+   * @param endpoint The endpoint involved in the transfer.
+   * @param update The transfer update containing status and progress information.
+   */
+  protected void onPayloadTransferUpdate(Endpoint endpoint, PayloadTransferUpdate update) {}
 
   /**
    * An optional hook to pool any permissions the app needs with the permissions ConnectionsActivity

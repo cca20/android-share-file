@@ -4,6 +4,9 @@ import android.Manifest;
 import android.animation.Animator;
 import android.animation.ObjectAnimator;
 import android.content.Context;
+import android.app.Activity;
+import android.content.Intent;
+import android.net.Uri;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
@@ -28,12 +31,14 @@ import android.text.style.ForegroundColorSpan;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewAnimationUtils;
+import android.widget.Button;
 import android.widget.TextView;
 import android.widget.Toast;
 import com.google.android.gms.nearby.connection.ConnectionInfo;
 import com.google.android.gms.nearby.connection.Payload;
 import com.google.android.gms.nearby.connection.Strategy;
 import java.io.IOException;
+import java.io.FileNotFoundException;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.Random;
@@ -80,6 +85,9 @@ public class MainActivity extends ConnectionsActivity implements SensorEventList
   /** Length of state change animations. */
   private static final long ANIMATION_DURATION = 600;
 
+  /** Request code for image picker result. */
+  private static final int READ_REQUEST_CODE = 42;
+
   /**
    * This service id lets us find other nearby devices that are interested in the same thing. Our
    * sample does exactly one thing, so we hardcode the ID.
@@ -117,18 +125,18 @@ public class MainActivity extends ConnectionsActivity implements SensorEventList
   /** Listens to holding/releasing the volume rocker. */
   private final GestureDetector mGestureDetector =
       new GestureDetector(KeyEvent.KEYCODE_VOLUME_DOWN, KeyEvent.KEYCODE_VOLUME_UP) {
-        @Override
-        protected void onHold() {
-          logV("onHold");
-          startRecording();
-        }
+    @Override
+    protected void onHold() {
+      logV("onHold");
+      startRecording();
+    }
 
-        @Override
-        protected void onRelease() {
-          logV("onRelease");
-          stopRecording();
-        }
-      };
+    @Override
+    protected void onRelease() {
+      logV("onRelease");
+      stopRecording();
+    }
+  };
 
   /** For recording audio as the user speaks. */
   @Nullable private AudioRecorder mRecorder;
@@ -148,11 +156,11 @@ public class MainActivity extends ConnectionsActivity implements SensorEventList
   /** Starts discovery. Used in a postDelayed manor with {@link #mUiHandler}. */
   private final Runnable mDiscoverRunnable =
       new Runnable() {
-        @Override
-        public void run() {
-          setState(State.DISCOVERING);
-        }
-      };
+    @Override
+    public void run() {
+      setState(State.DISCOVERING);
+    }
+  };
 
   @Override
   protected void onCreate(Bundle savedInstanceState) {
@@ -174,6 +182,117 @@ public class MainActivity extends ConnectionsActivity implements SensorEventList
     mName = generateRandomName();
 
     ((TextView) findViewById(R.id.name)).setText(mName);
+
+    // Setup Share button
+    Button shareButton = (Button) findViewById(R.id.share_button);
+    shareButton.setOnClickListener(new View.OnClickListener() {
+      @Override
+      public void onClick(View v) {
+        if (getConnectedEndpoints().isEmpty()) {
+          Toast.makeText(MainActivity.this, "No connected devices", Toast.LENGTH_SHORT).show();
+          return;
+        }
+        showImageChooser();
+      }
+    });
+  }
+
+  private void showImageChooser() {
+    Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+    intent.addCategory(Intent.CATEGORY_OPENABLE);
+    intent.setType("image/*");
+    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+    startActivityForResult(intent, READ_REQUEST_CODE);
+  }
+
+  @Override
+  protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+    super.onActivityResult(requestCode, resultCode, data);
+    if (requestCode == READ_REQUEST_CODE && resultCode == Activity.RESULT_OK && data != null) {
+      Uri uri = data.getData();
+      if (uri != null) {
+        // Check if still connected before sending
+        if (getConnectedEndpoints().isEmpty()) {
+          Toast.makeText(this, "No connected devices", Toast.LENGTH_SHORT).show();
+          return;
+        }
+
+        // Check if we're in CONNECTED state
+        if (getState() != State.CONNECTED) {
+          Toast.makeText(this, "Not connected to any device", Toast.LENGTH_SHORT).show();
+          return;
+        }
+
+        // Process file in background thread to avoid blocking UI and connection
+        final Uri finalUri = uri;
+        new Thread(new Runnable() {
+          @Override
+          @WorkerThread
+          public void run() {
+            ParcelFileDescriptor pfd = null;
+            try {
+              // Take persistable URI permission to ensure we can access the file
+              getContentResolver().takePersistableUriPermission(
+                  finalUri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+
+              pfd = getContentResolver().openFileDescriptor(finalUri, "r");
+              if (pfd != null) {
+                final ParcelFileDescriptor finalPfd = pfd;
+                Payload filePayload = Payload.fromFile(pfd);
+                logD("Sending FILE payload, ID: " + filePayload.getId());
+
+                // Send on main thread
+                final Payload finalPayload = filePayload;
+                runOnUiThread(new Runnable() {
+                  @Override
+                  @UiThread
+                  public void run() {
+                    // Double-check connection is still active before sending
+                    if (getConnectedEndpoints().isEmpty() || getState() != State.CONNECTED) {
+                      logW("Connection lost while preparing file", null);
+                      Toast.makeText(MainActivity.this, "Connection lost", Toast.LENGTH_SHORT).show();
+                      try {
+                        finalPfd.close();
+                      } catch (IOException e) {
+                        logE("Error closing file descriptor", e);
+                      }
+                      return;
+                    }
+
+                    send(finalPayload);
+                    Toast.makeText(MainActivity.this, "Sending photo...", Toast.LENGTH_SHORT).show();
+                  }
+                });
+              } else {
+                runOnUiThread(new Runnable() {
+                  @Override
+                  public void run() {
+                    logE("Failed to open file descriptor", null);
+                    Toast.makeText(MainActivity.this, "Failed to open file", Toast.LENGTH_SHORT).show();
+                  }
+                });
+              }
+            } catch (FileNotFoundException e) {
+              logE("File not found", e);
+              runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                  Toast.makeText(MainActivity.this, "File not found", Toast.LENGTH_SHORT).show();
+                }
+              });
+            } catch (Exception e) {
+              logE("Error sending file", e);
+              runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                  Toast.makeText(MainActivity.this, "Error sending file: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+                }
+              });
+            }
+          }
+        }).start();
+      }
+    }
   }
 
   @Override
@@ -196,7 +315,13 @@ public class MainActivity extends ConnectionsActivity implements SensorEventList
     audioManager.setStreamVolume(
         AudioManager.STREAM_MUSIC, audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC), 0);
 
-    setState(State.DISCOVERING);
+    // Only set to DISCOVERING if we're in UNKNOWN state (first start or after
+    // finishing)
+    // If we're already connected or in another state, preserve the current state
+    // This prevents disconnecting when returning from image picker
+    if (getState() == State.UNKNOWN) {
+      setState(State.DISCOVERING);
+    }
   }
 
   @Override
@@ -215,7 +340,12 @@ public class MainActivity extends ConnectionsActivity implements SensorEventList
       stopPlaying();
     }
 
-    setState(State.UNKNOWN);
+    // Only disconnect if the Activity is actually finishing (not just paused by
+    // another Activity)
+    // This prevents disconnecting when opening the image picker
+    if (isFinishing()) {
+      setState(State.UNKNOWN);
+    }
 
     mUiHandler.removeCallbacksAndMessages(null);
 
@@ -252,7 +382,7 @@ public class MainActivity extends ConnectionsActivity implements SensorEventList
   @Override
   protected void onEndpointConnected(Endpoint endpoint) {
     Toast.makeText(
-            this, getString(R.string.toast_connected, endpoint.getName()), Toast.LENGTH_SHORT)
+        this, getString(R.string.toast_connected, endpoint.getName()), Toast.LENGTH_SHORT)
         .show();
     setState(State.CONNECTED);
   }
@@ -260,7 +390,7 @@ public class MainActivity extends ConnectionsActivity implements SensorEventList
   @Override
   protected void onEndpointDisconnected(Endpoint endpoint) {
     Toast.makeText(
-            this, getString(R.string.toast_disconnected, endpoint.getName()), Toast.LENGTH_SHORT)
+        this, getString(R.string.toast_disconnected, endpoint.getName()), Toast.LENGTH_SHORT)
         .show();
 
     // If we lost all our endpoints, then we should reset the state of our app and go back
@@ -540,20 +670,20 @@ public class MainActivity extends ConnectionsActivity implements SensorEventList
     if (payload.getType() == Payload.Type.STREAM) {
       AudioPlayer player =
           new AudioPlayer(payload.asStream().asInputStream()) {
-            @WorkerThread
-            @Override
-            protected void onFinish() {
-              final AudioPlayer audioPlayer = this;
-              post(
-                  new Runnable() {
-                    @UiThread
-                    @Override
-                    public void run() {
-                      mAudioPlayers.remove(audioPlayer);
-                    }
-                  });
-            }
-          };
+        @WorkerThread
+        @Override
+        protected void onFinish() {
+          final AudioPlayer audioPlayer = this;
+          post(
+              new Runnable() {
+                @UiThread
+                @Override
+                public void run() {
+                  mAudioPlayers.remove(audioPlayer);
+                }
+              });
+        }
+      };
       mAudioPlayers.add(player);
       player.start();
     }

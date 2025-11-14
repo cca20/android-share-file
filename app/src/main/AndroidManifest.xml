@@ -1,6 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.google.location.nearby.apps.walkietalkie">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-sdk android:targetSdkVersion="31" />
 
@@ -20,6 +19,10 @@
 
     <!-- Required for recording audio -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    
+    <!-- Required for saving received files to Downloads folder -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
 
     <!-- For shake-to-advertise -->
     <uses-permission android:name="android.permission.VIBRATE" />
